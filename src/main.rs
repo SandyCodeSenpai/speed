@@ -257,7 +257,7 @@ impl eframe::App for App {
                 painter.text(
                     rect.center(),
                     Align2::CENTER_CENTER,
-                    "Open a PDF to start reading.\nSpace = play/pause   ←/→ = jump 10 words",
+                    "Open a PDF to start reading.\nSpace = play/pause   Left/Right arrows = jump 10 words",
                     FontId::proportional(20.0),
                     Color32::GRAY,
                 );
