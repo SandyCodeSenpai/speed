@@ -53,6 +53,9 @@ struct App {
     mode: Mode,
     last_scrolled: usize,
     hl_prev: usize,
+    page_secs: f32,
+    timer_page: usize,
+    tick: Instant,
     playing: bool,
     wpm: f32,
     last_advance: Instant,
@@ -250,6 +253,9 @@ impl App {
             mode: Mode::Pdf,
             last_scrolled: usize::MAX,
             hl_prev: usize::MAX,
+            page_secs: 0.0,
+            timer_page: 0,
+            tick: Instant::now(),
             playing: false,
             wpm: 300.0,
             last_advance: Instant::now(),
@@ -342,6 +348,21 @@ impl eframe::App for App {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Per-page stopwatch: counts reading time, resets on page change.
+        let dt = self.tick.elapsed();
+        self.tick = Instant::now();
+        if !self.words.is_empty() {
+            let p = self.current_page();
+            if p != self.timer_page {
+                self.timer_page = p;
+                self.page_secs = 0.0;
+            }
+            // dt guard skips the gap when paused (no repaints while idle)
+            if self.playing && dt < Duration::from_secs(1) {
+                self.page_secs += dt.as_secs_f32();
+            }
+        }
+
         // Advance the word on schedule.
         if self.playing {
             let delay = delay_for(&self.words[self.idx], self.wpm);
@@ -431,6 +452,8 @@ impl eframe::App for App {
                         self.goto_page(page);
                     }
                     ui.label(format!("{} / {}", self.idx + 1, self.words.len()));
+                    let s = self.page_secs as u32;
+                    ui.label(format!("{}:{:02} this page", s / 60, s % 60));
                 }
             });
         });
