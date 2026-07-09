@@ -22,8 +22,8 @@ fn main() -> eframe::Result {
 struct Word {
     text: String,
     para_end: bool,
-    page: usize,        // 0-based
-    rect: Option<Rect>, // position on page in PDF points; None without -bbox
+    page: usize, // 0-based
+    rect: Rect,  // position on page in PDF points
 }
 
 struct PageInfo {
@@ -31,7 +31,7 @@ struct PageInfo {
     height: f32,
 }
 
-#[derive(Serialize, Deserialize, Clone, Copy)]
+#[derive(Serialize, Deserialize)]
 struct Saved {
     index: usize,
     wpm: f32,
@@ -70,32 +70,6 @@ fn store_path() -> PathBuf {
         .join("rsvp-reader/progress.json")
 }
 
-/// Splits text into words plus the word index each page starts at
-/// (pdftotext separates pages with form feeds).
-fn split_words(text: &str) -> (Vec<Word>, Vec<usize>) {
-    let mut words = Vec::new();
-    let mut page_starts = Vec::new();
-    for page in text.split('\x0c') {
-        page_starts.push(words.len());
-        for para in page.split("\n\n") {
-            let toks: Vec<&str> = para.split_whitespace().collect();
-            let last = toks.len().saturating_sub(1);
-            for (i, t) in toks.iter().enumerate() {
-                words.push(Word {
-                    text: (*t).to_string(),
-                    para_end: i == last,
-                    page: page_starts.len() - 1,
-                    rect: None,
-                });
-            }
-        }
-    }
-    while page_starts.len() > 1 && *page_starts.last().unwrap() >= words.len() {
-        page_starts.pop();
-    }
-    (words, page_starts)
-}
-
 struct Chapter {
     level: usize,
     title: String,
@@ -116,28 +90,6 @@ fn load_toc(path: &Path) -> Vec<Chapter> {
         .unwrap_or_default()
 }
 
-fn extract_text(path: &Path) -> Result<String, String> {
-    // ponytail: prefer poppler's pdftotext when installed — it decodes
-    // CID/Identity-encoded fonts (common in ebooks) that pdf-extract can't.
-    if let Ok(out) = std::process::Command::new("pdftotext")
-        .arg(path)
-        .arg("-")
-        .output()
-    {
-        if out.status.success() {
-            let text = String::from_utf8_lossy(&out.stdout).into_owned();
-            if !text.trim().is_empty() {
-                return Ok(text);
-            }
-        }
-    }
-    // ponytail: pdf-extract can panic on malformed PDFs, so catch_unwind
-    let path = path.to_path_buf();
-    std::panic::catch_unwind(move || pdf_extract::extract_text(&path))
-        .map_err(|_| "PDF parser crashed on this file".to_string())?
-        .map_err(|e| e.to_string())
-}
-
 fn xml_attr(s: &str, key: &str) -> Option<f32> {
     let i = s.find(key)? + key.len();
     s[i..].split('"').next()?.parse().ok()
@@ -153,74 +105,79 @@ fn xml_unescape(s: &str) -> String {
 }
 
 /// Words with on-page bounding boxes via `pdftotext -bbox`.
-fn extract_bbox(path: &Path) -> Option<(Vec<Word>, Vec<PageInfo>)> {
+fn extract_bbox(path: &Path) -> Result<(Vec<Word>, Vec<PageInfo>), String> {
     let out = std::process::Command::new("pdftotext")
         .arg("-bbox")
         .arg(path)
         .arg("-")
         .output()
-        .ok()?;
+        .map_err(|_| "pdftotext not found — install poppler: brew install poppler".to_string())?;
     if !out.status.success() {
-        return None;
+        return Err(format!(
+            "pdftotext failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
     }
     let xml = String::from_utf8_lossy(&out.stdout);
     let mut words: Vec<Word> = Vec::new();
     let mut pages: Vec<PageInfo> = Vec::new();
+    let attrs = |rest: &str| -> Option<(f32, f32, f32, f32)> {
+        Some((
+            xml_attr(rest, "xMin=\"")?,
+            xml_attr(rest, "yMin=\"")?,
+            xml_attr(rest, "xMax=\"")?,
+            xml_attr(rest, "yMax=\"")?,
+        ))
+    };
     for line in xml.lines() {
         let t = line.trim();
         if let Some(rest) = t.strip_prefix("<page ") {
-            pages.push(PageInfo {
-                width: xml_attr(rest, "width=\"")?,
-                height: xml_attr(rest, "height=\"")?,
-            });
+            if let (Some(w), Some(h)) = (xml_attr(rest, "width=\""), xml_attr(rest, "height=\"")) {
+                pages.push(PageInfo { width: w, height: h });
+            }
         } else if let Some(rest) = t.strip_prefix("<word ") {
-            let text = xml_unescape(rest.split('>').nth(1)?.split('<').next()?);
+            let text = rest
+                .split('>')
+                .nth(1)
+                .and_then(|s| s.split('<').next())
+                .map(xml_unescape)
+                .unwrap_or_default();
             if text.trim().is_empty() || pages.is_empty() {
                 continue;
             }
-            words.push(Word {
-                text,
-                para_end: false,
-                page: pages.len() - 1,
-                rect: Some(Rect::from_min_max(
-                    egui::pos2(xml_attr(rest, "xMin=\"")?, xml_attr(rest, "yMin=\"")?),
-                    egui::pos2(xml_attr(rest, "xMax=\"")?, xml_attr(rest, "yMax=\"")?),
-                )),
-            });
+            if let Some((x0, y0, x1, y1)) = attrs(rest) {
+                words.push(Word {
+                    text,
+                    para_end: false,
+                    page: pages.len() - 1,
+                    rect: Rect::from_min_max(egui::pos2(x0, y0), egui::pos2(x1, y1)),
+                });
+            }
         }
     }
     if words.is_empty() {
-        return None;
+        return Err("No extractable text — is this a scanned/image-only PDF?".into());
     }
     // Paragraph ends: page break or a vertical gap larger than ~1.8 lines.
     for i in 0..words.len() {
         let end = i + 1 == words.len() || {
             let (a, b) = (&words[i], &words[i + 1]);
-            a.page != b.page
-                || b.rect.unwrap().min.y - a.rect.unwrap().min.y > 1.8 * a.rect.unwrap().height()
+            a.page != b.page || b.rect.min.y - a.rect.min.y > 1.8 * a.rect.height()
         };
         words[i].para_end = end;
     }
-    Some((words, pages))
+    Ok((words, pages))
 }
 
 fn extract_pdf(path: &Path) -> Result<(Vec<Word>, Vec<usize>, Vec<PageInfo>), String> {
-    if let Some((words, pages)) = extract_bbox(path) {
-        let mut page_starts = Vec::new();
-        for (i, w) in words.iter().enumerate() {
-            while page_starts.len() <= w.page {
-                page_starts.push(i);
-            }
+    let (words, pages) = extract_bbox(path)?;
+    let mut page_starts = Vec::new();
+    for (i, w) in words.iter().enumerate() {
+        while page_starts.len() <= w.page {
+            page_starts.push(i);
         }
-        return Ok((words, page_starts, pages));
     }
-    // Fallback: plain text extraction, no page images.
-    let text = extract_text(path)?;
-    let (words, page_starts) = split_words(&text);
-    if words.is_empty() {
-        return Err("No extractable text — is this a scanned/image-only PDF?".into());
-    }
-    Ok((words, page_starts, Vec::new()))
+    Ok((words, page_starts, pages))
 }
 
 /// Renders one page to an image with pdftoppm (runs on a background thread).
@@ -334,9 +291,6 @@ impl App {
                 self.words = words;
                 self.page_starts = page_starts;
                 self.toc = load_toc(&path);
-                if pages.is_empty() && self.mode == Mode::Pdf {
-                    self.mode = Mode::Reader; // no bbox data → no page view
-                }
                 self.pages = pages;
                 self.pdf_path = Some(path);
             }
@@ -439,9 +393,7 @@ impl eframe::App for App {
                         .step_by(25.0)
                         .text("WPM"),
                 );
-                if !self.pages.is_empty() {
-                    ui.selectable_value(&mut self.mode, Mode::Pdf, "PDF");
-                }
+                ui.selectable_value(&mut self.mode, Mode::Pdf, "PDF");
                 ui.selectable_value(&mut self.mode, Mode::Reader, "Reader");
                 ui.selectable_value(&mut self.mode, Mode::Focus, "Focus");
                 if !self.toc.is_empty() {
@@ -585,18 +537,13 @@ impl App {
         }
 
         // Highlight the current word at its real position.
-        if let Some(r) = self.words[self.idx].rect {
-            let hl = Rect::from_min_max(
-                img_rect.min + r.min.to_vec2() * scale,
-                img_rect.min + r.max.to_vec2() * scale,
-            )
-            .expand(2.0 * scale);
-            painter.rect_filled(
-                hl,
-                3.0,
-                Color32::from_rgba_unmultiplied(255, 200, 0, 110),
-            );
-        }
+        let r = self.words[self.idx].rect;
+        let hl = Rect::from_min_max(
+            img_rect.min + r.min.to_vec2() * scale,
+            img_rect.min + r.max.to_vec2() * scale,
+        )
+        .expand(2.0 * scale);
+        painter.rect_filled(hl, 3.0, Color32::from_rgba_unmultiplied(255, 200, 0, 110));
 
         // Click a word on the page to jump there.
         if resp.clicked() {
@@ -612,11 +559,9 @@ impl App {
                         .copied()
                         .unwrap_or(self.words.len()),
                 );
-                if let Some(i) = (lo..hi).find(|&i| {
-                    self.words[i]
-                        .rect
-                        .is_some_and(|r| r.expand(3.0).contains(pdf_pos))
-                }) {
+                if let Some(i) =
+                    (lo..hi).find(|&i| self.words[i].rect.expand(3.0).contains(pdf_pos))
+                {
                     self.idx = i;
                     self.last_advance = Instant::now();
                 }
@@ -629,68 +574,58 @@ impl App {
         let painter = ui.painter();
         let font = FontId::proportional(56.0);
 
-        {
-            let chars: Vec<char> = self.words[self.idx].text.chars().collect();
-            let orp = orp_index(chars.len());
-            let prefix: String = chars[..orp].iter().collect();
-            let orp_ch: String = chars[orp].to_string();
-            let suffix: String = chars[orp + 1..].iter().collect();
+        let chars: Vec<char> = self.words[self.idx].text.chars().collect();
+        let orp = orp_index(chars.len());
+        let prefix: String = chars[..orp].iter().collect();
+        let orp_ch: String = chars[orp].to_string();
+        let suffix: String = chars[orp + 1..].iter().collect();
 
-            // Pin the ORP letter at a fixed point so the eye never moves.
-            let anchor = egui::pos2(rect.left() + rect.width() * 0.45, rect.center().y);
-            let text_color = ui.visuals().strong_text_color();
-            let orp_rect = painter.text(
-                anchor,
-                Align2::CENTER_CENTER,
-                &orp_ch,
-                font.clone(),
-                Color32::from_rgb(220, 50, 50),
-            );
-            painter.text(
-                orp_rect.left_center(),
-                Align2::RIGHT_CENTER,
-                &prefix,
-                font.clone(),
-                text_color,
-            );
-            painter.text(
-                orp_rect.right_center(),
-                Align2::LEFT_CENTER,
-                &suffix,
-                font.clone(),
-                text_color,
-            );
+        // Pin the ORP letter at a fixed point so the eye never moves.
+        let anchor = egui::pos2(rect.left() + rect.width() * 0.45, rect.center().y);
+        let text_color = ui.visuals().strong_text_color();
+        let orp_rect = painter.text(
+            anchor,
+            Align2::CENTER_CENTER,
+            &orp_ch,
+            font.clone(),
+            Color32::from_rgb(220, 50, 50),
+        );
+        painter.text(
+            orp_rect.left_center(),
+            Align2::RIGHT_CENTER,
+            &prefix,
+            font.clone(),
+            text_color,
+        );
+        painter.text(
+            orp_rect.right_center(),
+            Align2::LEFT_CENTER,
+            &suffix,
+            font,
+            text_color,
+        );
 
-            // Guide ticks above and below the ORP.
-            let tick = Color32::from_gray(100);
-            painter.line_segment(
-                [anchor - egui::vec2(0.0, 60.0), anchor - egui::vec2(0.0, 44.0)],
-                (2.0, tick),
-            );
-            painter.line_segment(
-                [anchor + egui::vec2(0.0, 44.0), anchor + egui::vec2(0.0, 60.0)],
-                (2.0, tick),
-            );
-        }
+        // Guide ticks above and below the ORP.
+        let tick = Color32::from_gray(100);
+        painter.line_segment(
+            [anchor - egui::vec2(0.0, 60.0), anchor - egui::vec2(0.0, 44.0)],
+            (2.0, tick),
+        );
+        painter.line_segment(
+            [anchor + egui::vec2(0.0, 44.0), anchor + egui::vec2(0.0, 60.0)],
+            (2.0, tick),
+        );
     }
 
     /// E-reader style page view with the current word highlighted.
     fn draw_reader(&mut self, ui: &mut egui::Ui) {
-        // Display the current PDF page; if there are no page breaks
-        // (pdf-extract fallback), chunk into 400-word pseudo-pages.
-        let (start, end) = if self.page_starts.len() > 1 {
-            let page = self.current_page();
-            let start = self.page_starts[page - 1];
-            let end = self
-                .page_starts
-                .get(page)
-                .copied()
-                .unwrap_or(self.words.len());
-            (start, end)
-        } else {
-            let start = (self.idx / 400) * 400;
-            (start, (start + 400).min(self.words.len()))
-        };
+        let page = self.current_page();
+        let start = self.page_starts[page - 1];
+        let end = self
+            .page_starts
+            .get(page)
+            .copied()
+            .unwrap_or(self.words.len());
 
         let mut clicked: Option<usize> = None;
         let scroll_to = if self.idx != self.last_scrolled {
@@ -765,7 +700,7 @@ mod tests {
 
     #[test]
     fn delays_scale_with_punctuation_and_paragraphs() {
-        let w = |t: &str, p: bool| Word { text: t.into(), para_end: p, page: 0, rect: None };
+        let w = |t: &str, p: bool| Word { text: t.into(), para_end: p, page: 0, rect: Rect::ZERO };
         let base = delay_for(&w("word", false), 300.0);
         assert_eq!(base, Duration::from_millis(200));
         assert!(delay_for(&w("word,", false), 300.0) > base);
@@ -775,20 +710,8 @@ mod tests {
     }
 
     #[test]
-    fn split_flags_paragraph_ends() {
-        let (words, _) = split_words("One two.\n\nThree four.");
-        let texts: Vec<&str> = words.iter().map(|w| w.text.as_str()).collect();
-        assert_eq!(texts, ["One", "two.", "Three", "four."]);
-        assert_eq!(
-            words.iter().map(|w| w.para_end).collect::<Vec<_>>(),
-            [false, true, false, true]
-        );
-    }
-
-    #[test]
-    fn pages_split_on_form_feed() {
-        let (words, starts) = split_words("one two\x0cthree four\x0c");
-        assert_eq!(words.len(), 4);
-        assert_eq!(starts, [0, 2]); // trailing empty page dropped
+    fn xml_word_line_parses() {
+        assert_eq!(xml_attr(r#"xMin="226.04" yMin="103.8""#, "yMin=\""), Some(103.8));
+        assert_eq!(xml_unescape("a&amp;b&#39;s"), "a&b's");
     }
 }
