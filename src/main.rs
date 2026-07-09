@@ -29,11 +29,19 @@ struct Saved {
     wpm: f32,
 }
 
+#[derive(PartialEq, Clone, Copy)]
+enum Mode {
+    Reader,
+    Focus,
+}
+
 struct App {
     words: Vec<Word>,
     page_starts: Vec<usize>,
     toc: Vec<Chapter>,
     idx: usize,
+    mode: Mode,
+    last_scrolled: usize,
     playing: bool,
     wpm: f32,
     last_advance: Instant,
@@ -156,6 +164,8 @@ impl App {
             page_starts: Vec::new(),
             toc: Vec::new(),
             idx: 0,
+            mode: Mode::Reader,
+            last_scrolled: usize::MAX,
             playing: false,
             wpm: 300.0,
             last_advance: Instant::now(),
@@ -293,6 +303,8 @@ impl eframe::App for App {
                         .step_by(25.0)
                         .text("WPM"),
                 );
+                ui.selectable_value(&mut self.mode, Mode::Reader, "Reader");
+                ui.selectable_value(&mut self.mode, Mode::Focus, "Focus");
                 if !self.toc.is_empty() {
                     let mut jump: Option<usize> = None;
                     ui.menu_button("Chapters", |ui| {
@@ -343,13 +355,9 @@ impl eframe::App for App {
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            let rect = ui.available_rect_before_wrap();
-            let painter = ui.painter();
-            let font = FontId::proportional(56.0);
-
             if let Some(err) = &self.error {
-                painter.text(
-                    rect.center(),
+                ui.painter().text(
+                    ui.available_rect_before_wrap().center(),
                     Align2::CENTER_CENTER,
                     err,
                     FontId::proportional(20.0),
@@ -358,16 +366,30 @@ impl eframe::App for App {
                 return;
             }
             if self.words.is_empty() {
-                painter.text(
-                    rect.center(),
+                ui.painter().text(
+                    ui.available_rect_before_wrap().center(),
                     Align2::CENTER_CENTER,
-                    "Open a PDF to start reading.\nSpace = play/pause   Left/Right arrows = jump 10 words",
+                    "Open a PDF to start reading.\nSpace = play/pause   Left/Right arrows = jump 10 words\nClick any word to jump there",
                     FontId::proportional(20.0),
                     Color32::GRAY,
                 );
                 return;
             }
+            match self.mode {
+                Mode::Reader => self.draw_reader(ui),
+                Mode::Focus => self.draw_focus(ui),
+            }
+        });
+    }
+}
 
+impl App {
+    fn draw_focus(&mut self, ui: &mut egui::Ui) {
+        let rect = ui.available_rect_before_wrap();
+        let painter = ui.painter();
+        let font = FontId::proportional(56.0);
+
+        {
             let chars: Vec<char> = self.words[self.idx].text.chars().collect();
             let orp = orp_index(chars.len());
             let prefix: String = chars[..orp].iter().collect();
@@ -409,7 +431,84 @@ impl eframe::App for App {
                 [anchor + egui::vec2(0.0, 44.0), anchor + egui::vec2(0.0, 60.0)],
                 (2.0, tick),
             );
-        });
+        }
+    }
+
+    /// E-reader style page view with the current word highlighted.
+    fn draw_reader(&mut self, ui: &mut egui::Ui) {
+        // Display the current PDF page; if there are no page breaks
+        // (pdf-extract fallback), chunk into 400-word pseudo-pages.
+        let (start, end) = if self.page_starts.len() > 1 {
+            let page = self.current_page();
+            let start = self.page_starts[page - 1];
+            let end = self
+                .page_starts
+                .get(page)
+                .copied()
+                .unwrap_or(self.words.len());
+            (start, end)
+        } else {
+            let start = (self.idx / 400) * 400;
+            (start, (start + 400).min(self.words.len()))
+        };
+
+        let mut clicked: Option<usize> = None;
+        let scroll_to = if self.idx != self.last_scrolled {
+            self.last_scrolled = self.idx;
+            true
+        } else {
+            false
+        };
+        let sel = ui.visuals().selection;
+        let read_color = ui.visuals().weak_text_color();
+        let unread_color = ui.visuals().strong_text_color();
+
+        egui::ScrollArea::vertical()
+            .auto_shrink(false)
+            .show(ui, |ui| {
+                ui.vertical_centered(|ui| {
+                    ui.set_max_width(640.0);
+                    ui.add_space(24.0);
+                    let mut i = start;
+                    while i < end {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.spacing_mut().item_spacing = egui::vec2(7.0, 8.0);
+                            while i < end {
+                                let w = &self.words[i];
+                                let current = i == self.idx;
+                                let mut text =
+                                    egui::RichText::new(&w.text).size(19.0).color(
+                                        if i < self.idx { read_color } else { unread_color },
+                                    );
+                                if current {
+                                    text = text.color(sel.stroke.color).background_color(sel.bg_fill);
+                                }
+                                let resp = ui
+                                    .add(egui::Label::new(text).sense(egui::Sense::click()))
+                                    .on_hover_cursor(egui::CursorIcon::PointingHand);
+                                if resp.clicked() {
+                                    clicked = Some(i);
+                                }
+                                if current && scroll_to {
+                                    resp.scroll_to_me(Some(egui::Align::Center));
+                                }
+                                let para_end = w.para_end;
+                                i += 1;
+                                if para_end {
+                                    break;
+                                }
+                            }
+                        });
+                        ui.add_space(14.0);
+                    }
+                    ui.add_space(24.0);
+                });
+            });
+
+        if let Some(i) = clicked {
+            self.idx = i;
+            self.last_advance = Instant::now();
+        }
     }
 }
 
