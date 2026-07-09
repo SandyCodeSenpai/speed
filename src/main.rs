@@ -52,6 +52,7 @@ struct App {
     idx: usize,
     mode: Mode,
     last_scrolled: usize,
+    hl_prev: usize,
     playing: bool,
     wpm: f32,
     last_advance: Instant,
@@ -248,6 +249,7 @@ impl App {
             idx: 0,
             mode: Mode::Pdf,
             last_scrolled: usize::MAX,
+            hl_prev: usize::MAX,
             playing: false,
             wpm: 300.0,
             last_advance: Instant::now(),
@@ -536,13 +538,22 @@ impl App {
             );
         }
 
-        // Highlight the current word at its real position.
+        // Highlight the current word, gliding between positions so the eye
+        // tracks smoothly instead of saccading; snap on jumps and page turns.
         let r = self.words[self.idx].rect;
         let hl = Rect::from_min_max(
             img_rect.min + r.min.to_vec2() * scale,
             img_rect.min + r.max.to_vec2() * scale,
         )
         .expand(2.0 * scale);
+        let t = if self.hl_prev.abs_diff(self.idx) > 3 { 0.0 } else { 0.09 };
+        self.hl_prev = self.idx;
+        let ctx = ui.ctx();
+        let a = |k: u8, v: f32| ctx.animate_value_with_time(egui::Id::new(("hl", k)), v, t);
+        let hl = Rect::from_min_max(
+            egui::pos2(a(0, hl.min.x), a(1, hl.min.y)),
+            egui::pos2(a(2, hl.max.x), a(3, hl.max.y)),
+        );
         painter.rect_filled(hl, 3.0, Color32::from_rgba_unmultiplied(255, 200, 0, 110));
 
         // Click a word on the page to jump there.
