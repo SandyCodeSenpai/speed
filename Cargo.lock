@@ -2938,6 +2938,7 @@ version = "0.1.0"
 dependencies = [
  "dirs",
  "eframe",
+ "image",
  "lopdf",
  "pdf-extract",
  "rfd",

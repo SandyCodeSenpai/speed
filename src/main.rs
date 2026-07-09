@@ -1,9 +1,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use eframe::egui::{self, Align2, Color32, FontId, Key};
+use eframe::egui::{self, Align2, Color32, FontId, Key, Rect};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::{Duration, Instant};
 
 fn main() -> eframe::Result {
@@ -14,13 +15,20 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "RSVP Reader",
         options,
-        Box::new(|_cc| Ok(Box::new(App::load()))),
+        Box::new(|cc| Ok(Box::new(App::load(cc.egui_ctx.clone())))),
     )
 }
 
 struct Word {
     text: String,
     para_end: bool,
+    page: usize,        // 0-based
+    rect: Option<Rect>, // position on page in PDF points; None without -bbox
+}
+
+struct PageInfo {
+    width: f32,
+    height: f32,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy)]
@@ -31,6 +39,7 @@ struct Saved {
 
 #[derive(PartialEq, Clone, Copy)]
 enum Mode {
+    Pdf,
     Reader,
     Focus,
 }
@@ -38,6 +47,7 @@ enum Mode {
 struct App {
     words: Vec<Word>,
     page_starts: Vec<usize>,
+    pages: Vec<PageInfo>,
     toc: Vec<Chapter>,
     idx: usize,
     mode: Mode,
@@ -48,6 +58,10 @@ struct App {
     pdf_path: Option<PathBuf>,
     error: Option<String>,
     progress: HashMap<String, Saved>,
+    textures: HashMap<usize, egui::TextureHandle>,
+    pending: HashSet<usize>,
+    render_tx: Sender<(PathBuf, usize)>,
+    render_rx: Receiver<(usize, egui::ColorImage)>,
 }
 
 fn store_path() -> PathBuf {
@@ -70,6 +84,8 @@ fn split_words(text: &str) -> (Vec<Word>, Vec<usize>) {
                 words.push(Word {
                     text: (*t).to_string(),
                     para_end: i == last,
+                    page: page_starts.len() - 1,
+                    rect: None,
                 });
             }
         }
@@ -122,13 +138,111 @@ fn extract_text(path: &Path) -> Result<String, String> {
         .map_err(|e| e.to_string())
 }
 
-fn extract_pdf(path: &Path) -> Result<(Vec<Word>, Vec<usize>), String> {
+fn xml_attr(s: &str, key: &str) -> Option<f32> {
+    let i = s.find(key)? + key.len();
+    s[i..].split('"').next()?.parse().ok()
+}
+
+fn xml_unescape(s: &str) -> String {
+    s.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
+}
+
+/// Words with on-page bounding boxes via `pdftotext -bbox`.
+fn extract_bbox(path: &Path) -> Option<(Vec<Word>, Vec<PageInfo>)> {
+    let out = std::process::Command::new("pdftotext")
+        .arg("-bbox")
+        .arg(path)
+        .arg("-")
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let xml = String::from_utf8_lossy(&out.stdout);
+    let mut words: Vec<Word> = Vec::new();
+    let mut pages: Vec<PageInfo> = Vec::new();
+    for line in xml.lines() {
+        let t = line.trim();
+        if let Some(rest) = t.strip_prefix("<page ") {
+            pages.push(PageInfo {
+                width: xml_attr(rest, "width=\"")?,
+                height: xml_attr(rest, "height=\"")?,
+            });
+        } else if let Some(rest) = t.strip_prefix("<word ") {
+            let text = xml_unescape(rest.split('>').nth(1)?.split('<').next()?);
+            if text.trim().is_empty() || pages.is_empty() {
+                continue;
+            }
+            words.push(Word {
+                text,
+                para_end: false,
+                page: pages.len() - 1,
+                rect: Some(Rect::from_min_max(
+                    egui::pos2(xml_attr(rest, "xMin=\"")?, xml_attr(rest, "yMin=\"")?),
+                    egui::pos2(xml_attr(rest, "xMax=\"")?, xml_attr(rest, "yMax=\"")?),
+                )),
+            });
+        }
+    }
+    if words.is_empty() {
+        return None;
+    }
+    // Paragraph ends: page break or a vertical gap larger than ~1.8 lines.
+    for i in 0..words.len() {
+        let end = i + 1 == words.len() || {
+            let (a, b) = (&words[i], &words[i + 1]);
+            a.page != b.page
+                || b.rect.unwrap().min.y - a.rect.unwrap().min.y > 1.8 * a.rect.unwrap().height()
+        };
+        words[i].para_end = end;
+    }
+    Some((words, pages))
+}
+
+fn extract_pdf(path: &Path) -> Result<(Vec<Word>, Vec<usize>, Vec<PageInfo>), String> {
+    if let Some((words, pages)) = extract_bbox(path) {
+        let mut page_starts = Vec::new();
+        for (i, w) in words.iter().enumerate() {
+            while page_starts.len() <= w.page {
+                page_starts.push(i);
+            }
+        }
+        return Ok((words, page_starts, pages));
+    }
+    // Fallback: plain text extraction, no page images.
     let text = extract_text(path)?;
     let (words, page_starts) = split_words(&text);
     if words.is_empty() {
         return Err("No extractable text — is this a scanned/image-only PDF?".into());
     }
-    Ok((words, page_starts))
+    Ok((words, page_starts, Vec::new()))
+}
+
+/// Renders one page to an image with pdftoppm (runs on a background thread).
+fn render_page(path: &Path, page: usize) -> Option<egui::ColorImage> {
+    let n = (page + 1).to_string();
+    let root = std::env::temp_dir().join(format!("rsvp-{}-{}", std::process::id(), page));
+    // ponytail: fixed 144 dpi — re-render per zoom level if crispness matters
+    let status = std::process::Command::new("pdftoppm")
+        .args(["-png", "-r", "144", "-f", &n, "-l", &n, "-singlefile"])
+        .arg(path)
+        .arg(&root)
+        .status()
+        .ok()?;
+    if !status.success() {
+        return None;
+    }
+    let png = root.with_extension("png");
+    let bytes = std::fs::read(&png).ok()?;
+    let _ = std::fs::remove_file(&png);
+    let img = image::load_from_memory(&bytes).ok()?.to_rgba8();
+    let size = [img.width() as usize, img.height() as usize];
+    Some(egui::ColorImage::from_rgba_unmultiplied(size, &img))
 }
 
 /// Optimal recognition point: the letter your eye should land on, ~35% in.
@@ -154,17 +268,28 @@ fn delay_for(word: &Word, wpm: f32) -> Duration {
 }
 
 impl App {
-    fn load() -> Self {
+    fn load(ctx: egui::Context) -> Self {
         let progress: HashMap<String, Saved> = std::fs::read_to_string(store_path())
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
+        let (render_tx, req_rx) = channel::<(PathBuf, usize)>();
+        let (res_tx, render_rx) = channel();
+        std::thread::spawn(move || {
+            for (path, page) in req_rx {
+                if let Some(img) = render_page(&path, page) {
+                    let _ = res_tx.send((page, img));
+                    ctx.request_repaint();
+                }
+            }
+        });
         App {
             words: Vec::new(),
             page_starts: Vec::new(),
+            pages: Vec::new(),
             toc: Vec::new(),
             idx: 0,
-            mode: Mode::Reader,
+            mode: Mode::Pdf,
             last_scrolled: usize::MAX,
             playing: false,
             wpm: 300.0,
@@ -172,6 +297,10 @@ impl App {
             pdf_path: None,
             error: None,
             progress,
+            textures: HashMap::new(),
+            pending: HashSet::new(),
+            render_tx,
+            render_rx,
         }
     }
 
@@ -191,8 +320,10 @@ impl App {
 
     fn open_pdf(&mut self, path: PathBuf) {
         self.playing = false;
+        self.textures.clear();
+        self.pending.clear();
         match extract_pdf(&path) {
-            Ok((words, page_starts)) => {
+            Ok((words, page_starts, pages)) => {
                 self.error = None;
                 if let Some(saved) = self.progress.get(&path.to_string_lossy().into_owned()) {
                     self.idx = saved.index.min(words.len() - 1);
@@ -203,12 +334,17 @@ impl App {
                 self.words = words;
                 self.page_starts = page_starts;
                 self.toc = load_toc(&path);
+                if pages.is_empty() && self.mode == Mode::Pdf {
+                    self.mode = Mode::Reader; // no bbox data → no page view
+                }
+                self.pages = pages;
                 self.pdf_path = Some(path);
             }
             Err(e) => {
                 self.error = Some(e);
                 self.words.clear();
                 self.page_starts.clear();
+                self.pages.clear();
                 self.toc.clear();
                 self.pdf_path = None;
                 self.idx = 0;
@@ -303,6 +439,9 @@ impl eframe::App for App {
                         .step_by(25.0)
                         .text("WPM"),
                 );
+                if !self.pages.is_empty() {
+                    ui.selectable_value(&mut self.mode, Mode::Pdf, "PDF");
+                }
                 ui.selectable_value(&mut self.mode, Mode::Reader, "Reader");
                 ui.selectable_value(&mut self.mode, Mode::Focus, "Focus");
                 if !self.toc.is_empty() {
@@ -376,6 +515,7 @@ impl eframe::App for App {
                 return;
             }
             match self.mode {
+                Mode::Pdf => self.draw_pdf(ui),
                 Mode::Reader => self.draw_reader(ui),
                 Mode::Focus => self.draw_focus(ui),
             }
@@ -384,6 +524,106 @@ impl eframe::App for App {
 }
 
 impl App {
+    fn request_page(&mut self, page: usize) {
+        if page >= self.pages.len()
+            || self.textures.contains_key(&page)
+            || self.pending.contains(&page)
+        {
+            return;
+        }
+        if let Some(path) = &self.pdf_path {
+            self.pending.insert(page);
+            let _ = self.render_tx.send((path.clone(), page));
+        }
+    }
+
+    /// The real PDF page with the current word highlighted on it.
+    fn draw_pdf(&mut self, ui: &mut egui::Ui) {
+        // Collect finished renders into textures.
+        while let Ok((page, img)) = self.render_rx.try_recv() {
+            self.pending.remove(&page);
+            let tex = ui.ctx().load_texture(
+                format!("page-{page}"),
+                img,
+                egui::TextureOptions::LINEAR,
+            );
+            self.textures.insert(page, tex);
+        }
+
+        let page = self.words[self.idx].page;
+        self.request_page(page);
+        self.request_page(page + 1); // prefetch
+        if self.textures.len() > 8 {
+            let keep = page.saturating_sub(2)..=page + 2;
+            self.textures.retain(|p, _| keep.contains(p));
+        }
+
+        let avail = ui.available_rect_before_wrap();
+        let info = &self.pages[page];
+        let scale = (avail.width() / info.width).min(avail.height() / info.height);
+        let size = egui::vec2(info.width * scale, info.height * scale);
+        let img_rect = Rect::from_center_size(avail.center(), size);
+
+        let resp = ui.allocate_rect(img_rect, egui::Sense::click());
+        let painter = ui.painter();
+        if let Some(tex) = self.textures.get(&page) {
+            painter.image(
+                tex.id(),
+                img_rect,
+                Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                Color32::WHITE,
+            );
+        } else {
+            painter.rect_filled(img_rect, 4.0, Color32::from_gray(245));
+            painter.text(
+                img_rect.center(),
+                Align2::CENTER_CENTER,
+                "Rendering page…",
+                FontId::proportional(16.0),
+                Color32::GRAY,
+            );
+        }
+
+        // Highlight the current word at its real position.
+        if let Some(r) = self.words[self.idx].rect {
+            let hl = Rect::from_min_max(
+                img_rect.min + r.min.to_vec2() * scale,
+                img_rect.min + r.max.to_vec2() * scale,
+            )
+            .expand(2.0 * scale);
+            painter.rect_filled(
+                hl,
+                3.0,
+                Color32::from_rgba_unmultiplied(255, 200, 0, 110),
+            );
+        }
+
+        // Click a word on the page to jump there.
+        if resp.clicked() {
+            if let Some(pos) = resp.interact_pointer_pos() {
+                let pdf_pos = egui::pos2(
+                    (pos.x - img_rect.min.x) / scale,
+                    (pos.y - img_rect.min.y) / scale,
+                );
+                let (lo, hi) = (
+                    self.page_starts[page],
+                    self.page_starts
+                        .get(page + 1)
+                        .copied()
+                        .unwrap_or(self.words.len()),
+                );
+                if let Some(i) = (lo..hi).find(|&i| {
+                    self.words[i]
+                        .rect
+                        .is_some_and(|r| r.expand(3.0).contains(pdf_pos))
+                }) {
+                    self.idx = i;
+                    self.last_advance = Instant::now();
+                }
+            }
+        }
+    }
+
     fn draw_focus(&mut self, ui: &mut egui::Ui) {
         let rect = ui.available_rect_before_wrap();
         let painter = ui.painter();
@@ -525,7 +765,7 @@ mod tests {
 
     #[test]
     fn delays_scale_with_punctuation_and_paragraphs() {
-        let w = |t: &str, p: bool| Word { text: t.into(), para_end: p };
+        let w = |t: &str, p: bool| Word { text: t.into(), para_end: p, page: 0, rect: None };
         let base = delay_for(&w("word", false), 300.0);
         assert_eq!(base, Duration::from_millis(200));
         assert!(delay_for(&w("word,", false), 300.0) > base);
