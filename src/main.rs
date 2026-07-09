@@ -61,12 +61,30 @@ fn split_words(text: &str) -> Vec<Word> {
     words
 }
 
-fn extract_pdf(path: &Path) -> Result<Vec<Word>, String> {
+fn extract_text(path: &Path) -> Result<String, String> {
+    // ponytail: prefer poppler's pdftotext when installed — it decodes
+    // CID/Identity-encoded fonts (common in ebooks) that pdf-extract can't.
+    if let Ok(out) = std::process::Command::new("pdftotext")
+        .arg(path)
+        .arg("-")
+        .output()
+    {
+        if out.status.success() {
+            let text = String::from_utf8_lossy(&out.stdout).into_owned();
+            if !text.trim().is_empty() {
+                return Ok(text);
+            }
+        }
+    }
     // ponytail: pdf-extract can panic on malformed PDFs, so catch_unwind
     let path = path.to_path_buf();
-    let text = std::panic::catch_unwind(move || pdf_extract::extract_text(&path))
+    std::panic::catch_unwind(move || pdf_extract::extract_text(&path))
         .map_err(|_| "PDF parser crashed on this file".to_string())?
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| e.to_string())
+}
+
+fn extract_pdf(path: &Path) -> Result<Vec<Word>, String> {
+    let text = extract_text(path)?;
     let words = split_words(&text);
     if words.is_empty() {
         return Err("No extractable text — is this a scanned/image-only PDF?".into());
