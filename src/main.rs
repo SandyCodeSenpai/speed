@@ -209,17 +209,17 @@ fn orp_index(len: usize) -> usize {
 
 fn delay_for(word: &Word, wpm: f32) -> Duration {
     let base = 60_000.0 / wpm;
-    let mut m: f32 = 1.0;
-    if word.text.chars().count() > 8 {
-        m = 1.4;
-    }
+    // Smooth length scaling: 1.0x up to ~5 chars, +4% per char after,
+    // capped at 1.4x — no sudden cliff between "strategy" and "strategies".
+    let chars = word.text.chars().count() as f32;
+    let mut m = (0.8 + 0.04 * chars).clamp(1.0, 1.4);
     match word.text.chars().last() {
-        Some('.' | '!' | '?') => m = m.max(2.0),
-        Some(',' | ';' | ':') => m = m.max(1.5),
+        Some('.' | '!' | '?') => m = m.max(1.7),
+        Some(',' | ';' | ':') => m = m.max(1.3),
         _ => {}
     }
     if word.para_end {
-        m = m.max(2.5);
+        m = m.max(2.0);
     }
     Duration::from_millis((base * m) as u64)
 }
