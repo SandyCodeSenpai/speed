@@ -31,6 +31,8 @@ struct Saved {
 
 struct App {
     words: Vec<Word>,
+    page_starts: Vec<usize>,
+    toc: Vec<Chapter>,
     idx: usize,
     playing: bool,
     wpm: f32,
@@ -46,19 +48,48 @@ fn store_path() -> PathBuf {
         .join("rsvp-reader/progress.json")
 }
 
-fn split_words(text: &str) -> Vec<Word> {
+/// Splits text into words plus the word index each page starts at
+/// (pdftotext separates pages with form feeds).
+fn split_words(text: &str) -> (Vec<Word>, Vec<usize>) {
     let mut words = Vec::new();
-    for para in text.split("\n\n") {
-        let toks: Vec<&str> = para.split_whitespace().collect();
-        let last = toks.len().saturating_sub(1);
-        for (i, t) in toks.iter().enumerate() {
-            words.push(Word {
-                text: (*t).to_string(),
-                para_end: i == last,
-            });
+    let mut page_starts = Vec::new();
+    for page in text.split('\x0c') {
+        page_starts.push(words.len());
+        for para in page.split("\n\n") {
+            let toks: Vec<&str> = para.split_whitespace().collect();
+            let last = toks.len().saturating_sub(1);
+            for (i, t) in toks.iter().enumerate() {
+                words.push(Word {
+                    text: (*t).to_string(),
+                    para_end: i == last,
+                });
+            }
         }
     }
-    words
+    while page_starts.len() > 1 && *page_starts.last().unwrap() >= words.len() {
+        page_starts.pop();
+    }
+    (words, page_starts)
+}
+
+struct Chapter {
+    level: usize,
+    title: String,
+    page: usize, // 1-based
+}
+
+fn load_toc(path: &Path) -> Vec<Chapter> {
+    let Ok(doc) = lopdf::Document::load(path) else {
+        return Vec::new();
+    };
+    doc.get_toc()
+        .map(|t| {
+            t.toc
+                .into_iter()
+                .map(|e| Chapter { level: e.level, title: e.title, page: e.page })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn extract_text(path: &Path) -> Result<String, String> {
@@ -83,13 +114,13 @@ fn extract_text(path: &Path) -> Result<String, String> {
         .map_err(|e| e.to_string())
 }
 
-fn extract_pdf(path: &Path) -> Result<Vec<Word>, String> {
+fn extract_pdf(path: &Path) -> Result<(Vec<Word>, Vec<usize>), String> {
     let text = extract_text(path)?;
-    let words = split_words(&text);
+    let (words, page_starts) = split_words(&text);
     if words.is_empty() {
         return Err("No extractable text — is this a scanned/image-only PDF?".into());
     }
-    Ok(words)
+    Ok((words, page_starts))
 }
 
 /// Optimal recognition point: the letter your eye should land on, ~35% in.
@@ -122,6 +153,8 @@ impl App {
             .unwrap_or_default();
         App {
             words: Vec::new(),
+            page_starts: Vec::new(),
+            toc: Vec::new(),
             idx: 0,
             playing: false,
             wpm: 300.0,
@@ -149,7 +182,7 @@ impl App {
     fn open_pdf(&mut self, path: PathBuf) {
         self.playing = false;
         match extract_pdf(&path) {
-            Ok(words) => {
+            Ok((words, page_starts)) => {
                 self.error = None;
                 if let Some(saved) = self.progress.get(&path.to_string_lossy().into_owned()) {
                     self.idx = saved.index.min(words.len() - 1);
@@ -158,15 +191,37 @@ impl App {
                     self.idx = 0;
                 }
                 self.words = words;
+                self.page_starts = page_starts;
+                self.toc = load_toc(&path);
                 self.pdf_path = Some(path);
             }
             Err(e) => {
                 self.error = Some(e);
                 self.words.clear();
+                self.page_starts.clear();
+                self.toc.clear();
                 self.pdf_path = None;
                 self.idx = 0;
             }
         }
+    }
+
+    /// 1-based page the current word is on.
+    fn current_page(&self) -> usize {
+        self.page_starts.partition_point(|&s| s <= self.idx).max(1)
+    }
+
+    fn goto_page(&mut self, page: usize) {
+        if self.words.is_empty() {
+            return;
+        }
+        let start = self
+            .page_starts
+            .get(page.saturating_sub(1))
+            .copied()
+            .unwrap_or(0);
+        self.idx = start.min(self.words.len() - 1);
+        self.last_advance = Instant::now();
     }
 
     fn toggle_play(&mut self) {
@@ -238,7 +293,38 @@ impl eframe::App for App {
                         .step_by(25.0)
                         .text("WPM"),
                 );
+                if !self.toc.is_empty() {
+                    let mut jump: Option<usize> = None;
+                    ui.menu_button("Chapters", |ui| {
+                        ui.set_min_width(300.0);
+                        egui::ScrollArea::vertical().max_height(400.0).show(ui, |ui| {
+                            for ch in &self.toc {
+                                let label = format!(
+                                    "{}{}",
+                                    "    ".repeat(ch.level.saturating_sub(1)),
+                                    ch.title
+                                );
+                                if ui.button(label).clicked() {
+                                    jump = Some(ch.page);
+                                    ui.close();
+                                }
+                            }
+                        });
+                    });
+                    if let Some(page) = jump {
+                        self.goto_page(page);
+                    }
+                }
                 if !self.words.is_empty() {
+                    let mut page = self.current_page();
+                    let resp = ui.add(
+                        egui::DragValue::new(&mut page)
+                            .range(1..=self.page_starts.len())
+                            .prefix("page "),
+                    );
+                    if resp.changed() {
+                        self.goto_page(page);
+                    }
                     ui.label(format!("{} / {}", self.idx + 1, self.words.len()));
                 }
             });
@@ -351,12 +437,19 @@ mod tests {
 
     #[test]
     fn split_flags_paragraph_ends() {
-        let words = split_words("One two.\n\nThree four.");
+        let (words, _) = split_words("One two.\n\nThree four.");
         let texts: Vec<&str> = words.iter().map(|w| w.text.as_str()).collect();
         assert_eq!(texts, ["One", "two.", "Three", "four."]);
         assert_eq!(
             words.iter().map(|w| w.para_end).collect::<Vec<_>>(),
             [false, true, false, true]
         );
+    }
+
+    #[test]
+    fn pages_split_on_form_feed() {
+        let (words, starts) = split_words("one two\x0cthree four\x0c");
+        assert_eq!(words.len(), 4);
+        assert_eq!(starts, [0, 2]); // trailing empty page dropped
     }
 }
